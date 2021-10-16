@@ -1,0 +1,340 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Niveditha CR"
+date: "17 October 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this analysis we apply a machine learning algorithm to judge *how well* experimental subjects perform particular weightlifting exercises. Five male subjects were asked to perform a one handed dumbbell "biceps curl" in five different ways labelled A - E (A being 'correct' and B - E being four different kinds of deviation). The data were obtained from three sensors worn on the subjects' bodies and one sensor attached to the dumbbell; the dataset contains 160 data points altogether. 
+
+
+### Loading necessary packages
+
+```{r echo = T, message = F, warning = F}
+library(caret); library(kernlab); library(dplyr); library(RANN)
+```
+
+## Getting the data
+
+
+```{r echo = T}
+trainurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+trainfile <- "pml-training.csv"
+testfile <- "pml-testing.csv"
+if(!file.exists(trainfile)){
+  download.file(trainurl, trainfile)
+}
+if(!file.exists(testfile)){
+  download.file(testurl, testfile)
+}
+train <- read.csv(trainfile)
+test <- read.csv(testfile)
+```
+
+## Splitting a validation set from the training set
+
+Before we submit our results, we want a good estimate of the out-of-sample error to check that our model is good. So we should split off a "validation" dataset from our training dataset. Let's use 25% of the supplied training data for validation. We set a seed to ensure reproducibility.
+
+```{r echo = T}
+set.seed(2351)
+inTrain <- createDataPartition(y = train$classe, 
+                               p = 0.75, list = FALSE)
+training <- train[inTrain, ]
+validation <- train[-inTrain, ]
+```
+
+# Exploratory analysis
+
+Let's have a look at the distribution of some of the data. There are too many variables (158) to illustrate all of them so we pick a few examples. One of the first things we notice is that the data are often concentrated around several distinct values, not just one peak. This indicates that machine learning algorithms such as classification and regression trees (CART) may be more effective than model-based approaches such as generalized linear models.
+Let's plot histograms of four variables, say `pitch_belt`, `roll_belt`, `yaw_belt`, `total_accel_belt`, `max_roll_belt` and `roll_arm`.
+```{r echo = T}
+par(mfrow = c(2,3))
+with(training, {
+    hist(pitch_belt)
+    hist(roll_belt)
+    hist(yaw_belt)
+    hist(total_accel_belt)
+    hist(max_roll_belt)
+    hist(roll_arm)
+ }
+)
+```
+
+We included the last one (`roll_arm`) as an example of of a variable whose distribution is actually quite standard, unlike the others. 
+
+Some of the data are very skewed, for example, all of the variables whose names begin with `var`... are very skewed towards 0, so we perform a log transform to make the distributions more standardized. Let's plot some histograms showing how the log transformations make these distributions more normalized. We'll pick three of the `var`... variables to plot in the top row and plot the distributions of their log transforms in the bottom row.
+
+```{r echo = T}
+log_var_roll_arm        <- log10(training[,"var_roll_arm"]+0.01)
+log_var_accel_dumbbell  <- log10(training[,"var_accel_dumbbell"]+0.01)
+log_var_pitch_dumbbell  <- log10(training[,"var_pitch_dumbbell"]+0.01)
+#
+par(mfrow = c(2,3))
+#
+with(training, {
+    hist(var_roll_arm)
+    hist(var_accel_dumbbell)
+    hist(var_pitch_dumbbell)
+}
+)
+  hist(log_var_roll_arm)
+  hist(log_var_accel_dumbbell)  
+  hist(log_var_pitch_dumbbell)
+```
+
+# Preprocessing
+
+## Transforming variables
+
+As we noted above, the variables whose names begin with `var`... are very skewed towards 0, so we transform them with a base-10 log transform to make the distributions more standardized. We add a small offset of 0.01 before taking the logarithms to avoid encountering log(0). We use the regular expression `"^var"` inside the `grep()` function to identify which variables begin with "var". 
+
+```{r echo = T}
+# List of variables starting with "var"
+vars <- grep("^var", names(training))
+# Reset training in case we re-run this code chunk
+training <- train[inTrain, ]
+for(i in vars){
+  training[,i] <- log10(training[,i]+0.01) # Avoid log(0)
+}
+```
+
+## Imputing missing values
+
+There are lots of missing values in the dataset and the training algorithms will not be able to handle this. Therefor we should *impute* the missing values. We use the `caret` package's $k$-nearest-neighbours impute method.
+
+
+```{r echo = T}
+# The algorithm uses pseudo-random numbers so set the seed
+set.seed(13343) 
+# Remove the index variable
+trainingx <- training[,-1]
+# Use caret's preProcess function to create a preProcess object
+imputeObj2 <- preProcess(trainingx[,-159],
+                     method = "knnImpute")
+# Use caret's predict function with the preProcess object 
+# to create a dataset with the missing values imputed.
+imputed2 <- predict(imputeObj2, trainingx)
+```
+
+
+## Finding the most important variables
+
+The dataset is very large so it's not feasible to use the whole thing to simply train a model with the `caret` package. We will try to identify the most important variables and train the final model only on those ones. We will use a small subset of the observations to train a model. Even though the model won't be very accurate, it should give us an indication of which variables can be neglected. 
+
+Let's start by subsetting our dataset to just 5% of the training dataset, using the `createDataPartition` function.
+We want to use the remaining data as validation data, but we will only use half of it, to get speed at the cost of precision (our approach doesn't rely on a very precise estimation of the out-of-sample error at this stage).
+
+```{r echo = T}
+# Set a seed for reproducibility because createDataPartition is pseudo-random
+set.seed(2151)
+# Create a data partition. We have to input the outcome  
+inMini3 <- createDataPartition(y = imputed2$classe, 
+                               p = 0.05, 
+                               list = FALSE
+                               )
+# Use data partition to get a mini training set just as big.
+mini3 <- imputed2[inMini3, ]
+rest3 <- imputed2[-inMini3, ]
+# Create a mini validation set with 1/2 the leftover data from the 
+# training set
+inminival2 <- createDataPartition(y = rest3$classe,
+                                  p = 0.5, 
+                                  list = FALSE
+                                  )
+minival2 <- rest3[inminival2,]
+rm(rest3)
+```
+
+Now let us use the *random forest* (`rf`) method from the caret package to train a model on the `mini3` dataset. The model takes quite a long time (about 24 hours on this PC) to train so we save it to disk to avoid re-computing unless necessary. 
+
+```{r echo = T}
+if(!file.exists("minimodel4.rds")){
+    # Random forest is pseudorandom so seed for reproducibility
+    set.seed(4860) 
+    # Print model training progress
+    trainctrl <- trainControl(verboseIter = TRUE)
+    # Predict classe as a function of all other variables
+    minimodel4 <- train(classe ~ ., 
+                        data = mini3, 
+                        method = "rf", # Use random forest
+                        trControl = trainctrl
+                        )
+    saveRDS(minimodel4, "minimodel4.rds")
+} else {
+    minimodel4 <- readRDS("minimodel4.rds")
+}
+```
+
+We can estimate the out-of-sample error for this preliminary model by using it to predict the `classe` variable for the `minival2` dataset and comparing this to the true value.
+
+```{r echo = T, message = F, warning = F}
+# Predict on the minival2 dataset
+pred4 <- predict(minimodel4, newdata = minival2)
+# Compute the accuracy
+miniacc <- mean(pred4 == minival2$classe)
+miniacc
+```
+So the accuracy is about `r round(miniacc, 3)` which is quite good. Now let's work out which variables are the most important.
+
+### Identifying important variables
+
+To identify the important variables, we take the following approach. For each of the 158 variables, we re-compute the accuracy of the preliminary model but with the variable in question permuted randomly. The more important a variable is to the model, the more that randomizing it will impact the accuracy of the model. Conversely, if randomizing a variable barely affects the accuracy of the model, we know it is not important. 
+
+With the following code, we can compute a vector with one entry corresponding to each variable, which gives the accuracy if that variable is randomized.
+
+```{r echo = T}
+if(!file.exists("scores2.rds")){
+    scores2 <- NULL
+    for(i in 1:158){
+        print(i) # To indicate progress
+        # Reset all columns in temp
+        temp <- minival2
+        # Set seed because sample is pseudo-random
+        set.seed(19581) 
+        # Randomize the i'th column of temp
+        temp[,i] <- sample(temp[,i])
+        # Predict with i'th column randomized
+        samppred <- predict(minimodel4, newdata = temp)
+        # Join accuracy to "scores2" vector
+        scores2 <- c(scores2, mean(samppred == temp$classe))
+    }
+    saveRDS(scores2, "scores2.rds")
+} else {scores2 <- readRDS("scores2.rds")}
+plot(scores2, xlab = "Variable", ylab = "Accuracy", col = "blue", pch = 19)
+title("Accuracy with i'th variable randomized")
+```
+
+Looking at this plot, we see that the overwhelming majority of the variables have no impact on the model, because randomizing them has a negligible effect on accuracy. However, there are 9 data points where accuracy is about 0.90 or lower. We will use the corresponding variables to train a model from the full dataset. 
+
+Let us set a cuttoff at 0.91 and create a logical vector indicating which variables are important enough to cause the accuracy to dip below this cutoff.
+
+```{r echo = T}
+cutoff <- 0.91
+importantvars <- scores2 < cutoff
+sum(importantvars)
+```
+The number of `True` values is 9, which is what we expected from looking at the plot above.
+
+## Training on the full dataset 
+
+Now that we've worked out which variables are the most important ones, let's create a new dataframe subset to exclude all the rest (making sure we include the `classe` variable too).
+
+```{r echo = T}
+impdf <- imputed2[,c(importantvars,T)]
+```
+
+With this dataset, we can train a random forest model. *Random forests* is a machine learning algorithm based on the construction of multiple classification and regression trees (CART). In our case we use the default number of 500 trees in a forest. The splits in the trees are determined from the best out of a random sampling at each node of $m_{\text{try}}$ of the predictors, where $m_{\text{try}}$ is a model parameter which will be estimated. The random forests algorithm is described in more detail at this webpage:
+https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
+
+```{r echo = T}
+if(!file.exists("fullmod2.rds")){
+    # Set seed for reproducibility
+    set.seed(8473)
+    # Set verboseIter = TRUE to update progress
+    trainctrl <- trainControl(verboseIter = TRUE)
+    # Train classe as a function of all variables
+    fullmod2 <- train(classe ~ ., 
+                      data = impdf, 
+                      method = "rf", 
+                      trControl = trainctrl)
+    saveRDS(fullmod2, "fullmod2.rds")
+} else {
+    fullmod2 <- readRDS("fullmod2.rds")
+}
+```
+
+The model was trained with 25 resamplings for 3 different values of $m_{\text{try}}$. The results are shown in the following table; clearly $m_{\text{try}} = 14$ seems to provide the best results.
+
+```{r echo = T}
+fullmod2$results
+```
+
+We can print the *confusion matrix* for our training data, showing how accurate the model is on each type of data in the training set. Note that type A data is perfectly classified.
+
+```{r echo = T}
+fullmod2$finalModel$confusion
+```
+
+### Cross-validation
+
+We use the default type of error-estimation for this method, which is *bootstrapping* (we can check that with the following code)
+```{r echo = T}
+fullmod2$control$method
+```
+
+Bootstrapping (in this context) means that we take $N$ samples from our training data of size $N$, *with* replacement. So, many observations will appear in our resampled data more than once, while about $e^{-1} \approx 0.368$ of the samples won't be included at all (they're "out of bag" or OOB). Then for each resampling, we train a random forest using the resampled data. The OOB observations are then used to estimate the accuracy of the model, with varying values of the $m_{\text{try}}$ parameter. This process is repeated 25 times and averaged, to choose the optimal value of $m_{\text{try}}$ and to estimate the accuracy.
+
+### Out-of-sample error rate
+
+To predict our out-of-sample error rate, we use our validation data set in the trained model. This will predict values of the `classe` variable for each row in the validation data set. But since the validation data set was subset from the training dataset, we know the true values of the `classe` variable. We can compare the true value to the prediction, and see which proportion of cases we were right in. This proportion estimates the "accuracy" of the model on new data, which we can subtract from 1 to get the out-of-sample error rate.
+
+```{r echo = T}
+validationx <- validation[,-1]
+valimpute <- predict(imputeObj2, validationx)
+impvaldf <- valimpute[,c(importantvars,T)]
+fullpred <- predict(fullmod2, newdata = impvaldf)
+accuracy <- mean(fullpred == impvaldf$classe)
+accuracy
+```
+So this model has an out-of-sample error rate of `r round(1-accuracy,5)` or about `r round(100*(1-accuracy),2)`%, which is very good. The error rate is less than `r ceiling(100*(1-accuracy)/(1-miniacc))`% that of the model which was trained on all of the variables but using 5% as much data.
+
+## Predicting on the test data
+
+Our test data is a data frame of 20 rows with the `classe` variable missing. We can run our trained model on the test data to get predictions for the classe variables. First we need to perform all the same transformations on the test data that we performed on the training data.
+
+```{r echo = T}
+# Log transform the variables starting with var
+for(i in vars){
+  test[,i] <- log10(test[,i]+0.01)
+}
+# Remove the index column to match the training dataset
+testx <- test[,-1]
+# Impute the missing values using the impute object trained
+# on the training dataset
+testimpute <- predict(imputeObj2, testx)
+# Subset the dataframe to the variables we identified as important above
+imptestdf <- testimpute[,c(importantvars,T)]
+# Get predictions with the trained random forest
+testpred <- predict(fullmod2, newdata = imptestdf)
+testpred
+```
+Entering these values on coursera gives a score of 20/20.
+
+## Caveat
+
+Two of the strongest predictor variables listed the time at which the activity was recorded. This was such a strong predictor because the data consisted of continuously recorded observations from which the test data was subset. So if we knew at what time an observation occurred we could determine its `classe` with perfect accuracy just by looking at which other observations occurred at that time. For example, the first observation in the test set occurred with the `"raw_timestamp_part_1"` variable equal to `r test[1,"raw_timestamp_part_1"]`. In the training set, the observations with the matching timestamp are given by the following table:
+```{r echo = T}
+v <- "raw_timestamp_part_1"
+table(train[train[,v]==test[1,v], "classe"])
+```
+So just by looking at this table we could strongly suspect that the first activity in the dataset was type "B", without training any model (this matches the correct prediction from the random forest). Similarly, the rest of the observations in the test set can be predicted perfectly from the timestamp. 
+
+```{r echo = T}
+classes <- NULL
+# Create a vector of most common outcome for test timestamps
+for(i in 1:20){
+  classes <- c(classes, 
+               names(
+                 sort( # Sort by frequency of classes
+                   table(
+                     # Subset train data frame to the data
+                     # with matching test timestamp
+                     train[train[,v]==test[i,v], 
+                           "classe"]), 
+                   decreasing = T)
+                 )
+               [1]
+               )
+}
+classes
+identical(levels(testpred)[testpred], classes)
+```
+
+Because this variable would not be available for new observations, it is unlikely that the model would perform anywhere near as well "in the wild". For that purpose, it could certainly be beneficial to retrain the model with all of the timestamp variables stripped away. 
